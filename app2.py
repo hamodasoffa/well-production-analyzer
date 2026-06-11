@@ -1,0 +1,421 @@
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from io import StringIO
+
+# =========================
+# Page settings
+# =========================
+st.set_page_config(
+    page_title="Well Production Analyzer",
+    page_icon="🛢️",
+    layout="wide"
+)
+
+st.title("🛢️ Well Production Test Analyzer")
+st.write("Upload Excel Test Sheet, choose parameters, add events, and generate interactive production plots.")
+
+# =========================
+# Sidebar
+# =========================
+uploaded_file = st.sidebar.file_uploader(
+    "Upload Excel Test Sheet",
+    type=["xlsx", "xls"]
+)
+
+st.sidebar.header("Excel Reading Settings")
+sheet_index = st.sidebar.number_input(
+    "Sheet Number",
+    min_value=0,
+    value=1,
+    help="0 = first sheet, 1 = second sheet"
+)
+
+start_row = st.sidebar.number_input(
+    "Start Data Row",
+    min_value=0,
+    value=17,
+    help="Row index starts from 0"
+)
+
+end_row = st.sidebar.number_input(
+    "End Data Row",
+    min_value=1,
+    value=46,
+    help="Increase this if your test sheet has more readings"
+)
+
+st.sidebar.header("Select Parameters")
+
+parameter_options = {
+    "Gross Rate": st.sidebar.checkbox("Gross Rate", True),
+    "Oil Rate": st.sidebar.checkbox("Oil Rate", True),
+    "Water Rate": st.sidebar.checkbox("Water Rate", True),
+    "Gas Rate": st.sidebar.checkbox("Gas Rate", True),
+    "WHP": st.sidebar.checkbox("WHP", True),
+    "FLP": st.sidebar.checkbox("FLP", False),
+    "Choke": st.sidebar.checkbox("Choke", False),
+    "BS&W": st.sidebar.checkbox("BS&W", False),
+    "Salinity": st.sidebar.checkbox("Salinity", False),
+}
+
+st.sidebar.header("Event Manager")
+
+event_count = st.sidebar.number_input(
+    "Number of Events",
+    min_value=0,
+    max_value=20,
+    value=0
+)
+
+events = []
+
+for i in range(event_count):
+    st.sidebar.markdown(f"### Event {i + 1}")
+
+    event_time = st.sidebar.text_input(
+        f"Event Time {i + 1}",
+        key=f"event_time_{i}",
+        placeholder="Example: 05:00"
+    )
+
+    event_parameter = st.sidebar.selectbox(
+        f"Attach To Parameter {i + 1}",
+        list(parameter_options.keys()),
+        key=f"event_parameter_{i}"
+    )
+
+    event_comment = st.sidebar.text_area(
+        f"Comment {i + 1}",
+        key=f"event_comment_{i}",
+        placeholder="Example: Generator trip / Well restarted"
+    )
+
+    if event_time and event_comment:
+        events.append(
+            {
+                "time": event_time.strip(),
+                "parameter": event_parameter,
+                "comment": event_comment
+            }
+        )
+
+# =========================
+# Functions
+# =========================
+def format_time_value(value):
+    """Convert Excel time/date values into clean HH:MM text when possible."""
+    if pd.isna(value):
+        return ""
+
+    try:
+        if hasattr(value, "strftime"):
+            return value.strftime("%H:%M")
+    except Exception:
+        pass
+
+    text = str(value).strip()
+
+    if " " in text and ":" in text:
+        try:
+            return pd.to_datetime(text).strftime("%H:%M")
+        except Exception:
+            return text
+
+    if ":" in text:
+        parts = text.split(":")
+        if len(parts) >= 2:
+            return f"{parts[0].zfill(2)}:{parts[1].zfill(2)}"
+
+    return text
+
+
+def load_test_sheet(file, sheet_index, start_row, end_row):
+    """
+    Reads the user's test sheet format.
+
+    Expected columns based on your uploaded file:
+    Time        = Column B
+    Choke       = Column C
+    WHP         = Column D
+    FLP         = Column E
+    Gas Rate    = Column M
+    Oil Rate    = Column W
+    Water Rate  = Column X
+    BS&W        = Column Y
+    Salinity    = Column Z
+    Gross Rate  = Column AA
+    """
+    raw = pd.read_excel(file, sheet_name=sheet_index, header=None)
+    df = raw.iloc[start_row:end_row].copy()
+
+    final = pd.DataFrame()
+
+    final["Date"] = df.iloc[:, 0]
+    final["Time"] = df.iloc[:, 1].apply(format_time_value)
+    final["Choke"] = pd.to_numeric(df.iloc[:, 2], errors="coerce")
+    final["WHP"] = pd.to_numeric(df.iloc[:, 3], errors="coerce")
+    final["FLP"] = pd.to_numeric(df.iloc[:, 4], errors="coerce")
+    final["Gas Rate"] = pd.to_numeric(df.iloc[:, 12], errors="coerce")
+    final["Oil Rate"] = pd.to_numeric(df.iloc[:, 22], errors="coerce")
+    final["Water Rate"] = pd.to_numeric(df.iloc[:, 23], errors="coerce")
+    final["BS&W"] = pd.to_numeric(df.iloc[:, 24], errors="coerce")
+    final["Salinity"] = pd.to_numeric(df.iloc[:, 25], errors="coerce")
+    final["Gross Rate"] = pd.to_numeric(df.iloc[:, 26], errors="coerce")
+
+    final = final.dropna(subset=["Time"])
+    final = final[final["Time"].astype(str).str.strip() != ""]
+
+    final = final[
+        final["Gross Rate"].notna()
+        | final["Oil Rate"].notna()
+        | final["Water Rate"].notna()
+        | final["Gas Rate"].notna()
+        | final["WHP"].notna()
+    ]
+
+    final = final.reset_index(drop=True)
+
+    return final
+
+
+def get_well_info(file, sheet_index):
+    """Try to read well name and test date from the sheet. If failed, use defaults."""
+    raw = pd.read_excel(file, sheet_name=sheet_index, header=None)
+
+    well_name = "Unknown Well"
+    test_date = ""
+
+    try:
+        possible_well = raw.iloc[2, 2]
+        if pd.notna(possible_well):
+            well_name = str(possible_well)
+    except Exception:
+        pass
+
+    try:
+        possible_date = raw.iloc[0, 25]
+        if pd.notna(possible_date):
+            test_date = pd.to_datetime(possible_date).strftime("%d/%m/%Y")
+    except Exception:
+        pass
+
+    return well_name, test_date
+
+
+def build_plot(df, selected_parameters, events, well_name, test_date):
+    units = {
+        "Gross Rate": "BBL/D",
+        "Oil Rate": "STB/D",
+        "Water Rate": "BBL/D",
+        "Gas Rate": "MMSCF/D",
+        "WHP": "PSI",
+        "FLP": "PSI",
+        "Choke": "%",
+        "BS&W": "%",
+        "Salinity": "K PPM",
+    }
+
+    colors = {
+        "Gross Rate": "#0033ff",
+        "Oil Rate": "#008000",
+        "Water Rate": "#ff0000",
+        "Gas Rate": "#ff9900",
+        "WHP": "#6f00ff",
+        "FLP": "#8b4513",
+        "Choke": "#111111",
+        "BS&W": "#990000",
+        "Salinity": "#008b8b",
+    }
+
+    fig = make_subplots(
+        rows=len(selected_parameters),
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        subplot_titles=[f"{p.upper()} ({units[p]})" for p in selected_parameters],
+    )
+
+    for row_number, parameter in enumerate(selected_parameters, start=1):
+        fig.add_trace(
+            go.Scatter(
+                x=df["Time"],
+                y=df[parameter],
+                mode="lines+markers+text",
+                text=[
+                    f"{v:.2f}" if pd.notna(v) and abs(v) < 10 else f"{v:.0f}" if pd.notna(v) else ""
+                    for v in df[parameter]
+                ],
+                textposition="top center",
+                name=parameter,
+                line=dict(color=colors[parameter], width=2),
+                marker=dict(color=colors[parameter], size=8),
+                textfont=dict(color=colors[parameter], size=12),
+                hovertemplate=(
+                    "<b>Time:</b> %{x}<br>"
+                    f"<b>{parameter}:</b> %{{y}} {units[parameter]}<br>"
+                    "<extra></extra>"
+                ),
+            ),
+            row=row_number,
+            col=1,
+        )
+
+        fig.update_yaxes(
+            title_text=units[parameter],
+            row=row_number,
+            col=1,
+            showgrid=True,
+            gridcolor="rgba(0,0,0,0.12)",
+        )
+
+        # Event annotations
+        for event in events:
+            if event["parameter"] == parameter:
+                event_time = event["time"].strip()
+
+                if event_time in df["Time"].astype(str).values:
+                    point_row = df[df["Time"].astype(str) == event_time].iloc[0]
+                    y_value = point_row[parameter]
+
+                    if pd.notna(y_value):
+                        fig.add_annotation(
+                            x=event_time,
+                            y=y_value,
+                            text=event["comment"],
+                            showarrow=True,
+                            arrowhead=2,
+                            arrowsize=1,
+                            arrowwidth=2,
+                            arrowcolor="black",
+                            ax=80,
+                            ay=-80,
+                            bordercolor="black",
+                            borderwidth=1,
+                            borderpad=6,
+                            bgcolor="lightyellow",
+                            opacity=0.95,
+                            row=row_number,
+                            col=1,
+                        )
+
+    fig.update_layout(
+        title=(
+            f"<b>Production Test Results vs Time</b><br>"
+            f"Well: {well_name} &nbsp;&nbsp; Date: {test_date}"
+        ),
+        height=max(520, 300 * len(selected_parameters)),
+        hovermode="x unified",
+        template="plotly_white",
+        showlegend=True,
+        margin=dict(l=60, r=40, t=120, b=60),
+        font=dict(size=14),
+    )
+
+    fig.update_xaxes(
+        title_text="Time",
+        row=len(selected_parameters),
+        col=1,
+        showgrid=True,
+        gridcolor="rgba(0,0,0,0.12)",
+    )
+
+    return fig
+
+
+def summary_table(df, selected_parameters):
+    rows = []
+
+    for p in selected_parameters:
+        rows.append(
+            {
+                "Parameter": p,
+                "Average": round(df[p].mean(), 2),
+                "Maximum": round(df[p].max(), 2),
+                "Minimum": round(df[p].min(), 2),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+# =========================
+# Main App
+# =========================
+if uploaded_file:
+    try:
+        df = load_test_sheet(uploaded_file, sheet_index, start_row, end_row)
+        well_name, test_date = get_well_info(uploaded_file, sheet_index)
+
+        st.subheader(f"Well: {well_name}")
+        if test_date:
+            st.write(f"Test Date: {test_date}")
+
+        with st.expander("Show Uploaded Data"):
+            st.dataframe(df, use_container_width=True)
+
+        selected_parameters = [
+            parameter for parameter, checked in parameter_options.items() if checked
+        ]
+
+        if len(selected_parameters) == 0:
+            st.warning("اختار Parameter واحد على الأقل من الـ Checkbox.")
+        elif df.empty:
+            st.error("No valid data found. جرّب تغير Start Data Row / End Data Row.")
+        else:
+            # Time range selector
+            st.sidebar.header("Time Range Filter")
+            all_times = df["Time"].astype(str).tolist()
+
+            if len(all_times) > 1:
+                start_time, end_time = st.sidebar.select_slider(
+                    "Select Time Range",
+                    options=all_times,
+                    value=(all_times[0], all_times[-1]),
+                )
+
+                start_idx = all_times.index(start_time)
+                end_idx = all_times.index(end_time)
+
+                if start_idx <= end_idx:
+                    df_plot = df.iloc[start_idx : end_idx + 1].copy()
+                else:
+                    df_plot = df.iloc[end_idx : start_idx + 1].copy()
+            else:
+                df_plot = df.copy()
+
+            fig = build_plot(
+                df_plot,
+                selected_parameters,
+                events,
+                well_name,
+                test_date,
+            )
+
+            st.plotly_chart(fig, use_container_width=True)
+
+            st.subheader("Summary")
+            st.dataframe(
+                summary_table(df_plot, selected_parameters),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            html_buffer = StringIO()
+            fig.write_html(html_buffer)
+
+            st.download_button(
+                label="Download Interactive Plot HTML",
+                data=html_buffer.getvalue(),
+                file_name=f"{well_name}_production_plot.html",
+                mime="text/html",
+            )
+
+    except Exception as e:
+        st.error("حصل Error أثناء قراءة الملف.")
+        st.write("تفاصيل الخطأ:")
+        st.code(str(e))
+        st.info("جرّب تغير Sheet Number أو Start/End Row من الشمال.")
+else:
+    st.info("ارفع Excel Test Sheet من الشمال علشان يبدأ التحليل.")
